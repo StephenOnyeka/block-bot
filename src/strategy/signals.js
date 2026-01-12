@@ -135,7 +135,7 @@ class SignalDetector {
    * Helper to find recent swing points (ZigZag like)
    * Simple implementation: highest/lowest of N neighbors
    */
-  findSwingPoints(candles, period = 5) {
+  findSwingPoints(candles, period = 3) {
     const swings = [];
     for (let i = period; i < candles.length - period; i++) {
       const currentHigh = candles[i].high;

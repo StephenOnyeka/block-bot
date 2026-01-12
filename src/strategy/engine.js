@@ -60,12 +60,18 @@ class StrategyEngine {
   }
 
   async initializeHistory(symbol) {
-    // Fetch 1h candles
-    const h1 = await derivClient.getCandles(
-      symbol,
-      config.strategy.timeframes.analysis,
-      100
+    const analysisFreq = config.strategy.timeframes.analysis;
+    const executionFreq = config.strategy.timeframes.execution;
+
+    console.log(
+      `[DEBUG] ${symbol} - Analysis Freq: ${analysisFreq} (${typeof analysisFreq})`
     );
+    console.log(
+      `[DEBUG] ${symbol} - Execution Freq: ${executionFreq} (${typeof executionFreq})`
+    );
+
+    // Fetch 1h candles
+    const h1 = await derivClient.getCandles(symbol, analysisFreq, 100);
     this.state[symbol].candles1h = h1.candles;
 
     // Fetch 5m candles
@@ -89,41 +95,54 @@ class StrategyEngine {
 
   async onCandleUpdate(symbol, candle) {
     const state = this.state[symbol];
-    const lastSaved = state.candles5m[state.candles5m.length - 1];
 
-    // Check if it's a new candle or update
-    if (lastSaved && candle.epoch === lastSaved.epoch) {
-      // Update the last candle
+    // Normalize candle time: historical candles use 'epoch', stream uses 'open_time'
+    const candleOpenTime = candle.open_time || candle.epoch;
+    const lastSaved = state.candles5m[state.candles5m.length - 1];
+    const lastOpenTime = lastSaved ? lastSaved.open_time || lastSaved.epoch : 0;
+
+    // Check if it's an update to the current candle
+    if (lastSaved && candleOpenTime === lastOpenTime) {
       state.candles5m[state.candles5m.length - 1] = candle;
-    } else {
-      // New candle closed (implied), push new one
-      // Note: Deriv stream sends the *current* forming candle.
-      // When epoch changes, the previous one is closed.
-      if (lastSaved && candle.epoch > lastSaved.epoch) {
+    }
+    // It's a brand new candle
+    else if (candleOpenTime > lastOpenTime) {
+      if (lastSaved) {
+        // The previous candle is now officially closed
         this.onCandleClose(symbol, lastSaved);
-        state.candles5m.push(candle);
-        // Keep array size manageable
-        if (state.candles5m.length > 200) state.candles5m.shift();
-      } else if (!lastSaved) {
-        state.candles5m.push(candle);
       }
+      state.candles5m.push(candle);
+      if (state.candles5m.length > 200) state.candles5m.shift();
     }
   }
 
   async onCandleClose(symbol, closedCandle) {
-    console.log(`[${symbol}] 5M Candle Closed: ${closedCandle.epoch}`);
+    const timeStr = new Date(closedCandle.epoch * 1000).toLocaleString();
+    console.log(
+      `[${symbol}] 5M Candle Closed: ${closedCandle.epoch} (${timeStr})`
+    );
     const state = this.state[symbol];
 
     this.analyzeStructure(symbol);
     const swings = state.swings;
 
+    if (swings.length > 0) {
+      const lastHigh = swings.filter((s) => s.type === "high").pop();
+      const lastLow = swings.filter((s) => s.type === "low").pop();
+      console.log(
+        `[${symbol}] Monitoring - High: ${lastHigh?.price || "N/A"}, Low: ${
+          lastLow?.price || "N/A"
+        }`
+      );
+    }
+
     // 0. Check 1H Structure (Context)
-    // For simplicity, we check if 1H is trending (higher highs or lower lows)
     const h1Structure = this.get1HStructure(symbol);
     console.log(`[${symbol}] 1H Structure: ${h1Structure || "Ranging"}`);
 
     // If we have an active setup we're watching, check for the next step
     if (state.pendingSetup) {
+      console.log(`[${symbol}] WATCHING: ${state.pendingSetup.stage} setup...`);
       this.processPendingSetup(symbol, closedCandle, h1Structure);
       return;
     }
@@ -134,11 +153,10 @@ class StrategyEngine {
       const sweep = signals.checkLiquiditySweep(state.candles5m, lastSwing);
 
       if (sweep) {
-        console.log(`[${symbol}] Sweep detected! Type: ${sweep.type}`);
-        // Only take sweeps that align with 1H structure OR are potentially reversal CHoCH
+        console.log(`[${symbol}] >>> SWEEP DETECTED! <<< Type: ${sweep.type}`);
         state.pendingSetup = {
           stage: "SWEPT",
-          type: sweep.type, // bearish_sweep (took high) or bullish_sweep (took low)
+          type: sweep.type,
           sweepCandle: sweep.candle,
           timestamp: Date.now(),
         };
