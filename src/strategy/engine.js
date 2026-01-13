@@ -33,13 +33,22 @@ class StrategyEngine {
             candles1h: [],
             swings: [],
             structure: null,
-            pendingOrderBlock: null,
+            pendingSetup: null,
+            trend1h: null,
           };
 
           // 1. Fetch History
           await this.initializeHistory(symbol);
 
-          // 2. Subscribe to 5m Candles
+          // 2. Initial Analysis
+          await this.analyze1HStructure(symbol);
+          console.log(
+            `[${symbol}] Initial 1H Trend: ${
+              this.state[symbol].trend1h || "N/A"
+            }`
+          );
+
+          // 3. Subscribe to 5m Candles
           console.log(`Subscribing to 5m candles for ${symbol}`);
           await derivClient.subscribeCandles(
             symbol,
@@ -54,26 +63,23 @@ class StrategyEngine {
           }
         }
       }
+
+      this.startHeartbeat();
     } catch (error) {
       console.error("Error starting engine:", error);
     }
   }
 
+  startHeartbeat() {
+    setInterval(() => {
+      const symbols = Object.keys(this.state).join(", ");
+      console.log(
+        `[HEARTBEAT] Bot is active and monitoring: ${symbols} at ${new Date().toLocaleTimeString()}`
+      );
+    }, 60000); // Every minute
+  }
+
   async initializeHistory(symbol) {
-    const analysisFreq = config.strategy.timeframes.analysis;
-    const executionFreq = config.strategy.timeframes.execution;
-
-    console.log(
-      `[DEBUG] ${symbol} - Analysis Freq: ${analysisFreq} (${typeof analysisFreq})`
-    );
-    console.log(
-      `[DEBUG] ${symbol} - Execution Freq: ${executionFreq} (${typeof executionFreq})`
-    );
-
-    // Fetch 1h candles
-    const h1 = await derivClient.getCandles(symbol, analysisFreq, 100);
-    this.state[symbol].candles1h = h1.candles;
-
     // Fetch 5m candles
     const m5 = await derivClient.getCandles(
       symbol,
@@ -84,6 +90,29 @@ class StrategyEngine {
 
     // Initial Analysis
     this.analyzeStructure(symbol);
+  }
+
+  async analyze1HStructure(symbol) {
+    try {
+      const h1 = await derivClient.getCandles(
+        symbol,
+        config.strategy.timeframes.analysis, // 3600
+        24
+      );
+      this.state[symbol].candles1h = h1.candles;
+
+      const candles = h1.candles;
+      if (candles.length < 10) return;
+
+      const last = candles[candles.length - 1];
+      const prev = candles[candles.length - 10];
+
+      if (last.close > prev.close) this.state[symbol].trend1h = "bullish";
+      else if (last.close < prev.close) this.state[symbol].trend1h = "bearish";
+      else this.state[symbol].trend1h = "ranging";
+    } catch (error) {
+      console.error(`[${symbol}] Error analyzing 1H structure:`, error);
+    }
   }
 
   analyzeStructure(symbol) {
@@ -113,6 +142,11 @@ class StrategyEngine {
       }
       state.candles5m.push(candle);
       if (state.candles5m.length > 200) state.candles5m.shift();
+
+      // Update 1H trend every hour (approx)
+      if (state.candles5m.length % 12 === 0) {
+        this.analyze1HStructure(symbol);
+      }
     }
   }
 
@@ -136,49 +170,58 @@ class StrategyEngine {
       );
     }
 
-    // 0. Check 1H Structure (Context)
-    const h1Structure = this.get1HStructure(symbol);
-    console.log(`[${symbol}] 1H Structure: ${h1Structure || "Ranging"}`);
+    // 0. Check 1H Trend (HTF Context)
+    const trend1h = state.trend1h;
+    console.log(`[${symbol}] Current 1H Context: ${trend1h || "Unknown"}`);
 
     // If we have an active setup we're watching, check for the next step
     if (state.pendingSetup) {
       console.log(`[${symbol}] WATCHING: ${state.pendingSetup.stage} setup...`);
-      this.processPendingSetup(symbol, closedCandle, h1Structure);
+      this.processPendingSetup(symbol, closedCandle, trend1h);
       return;
     }
 
-    // 1. Check for Liquidity Sweep
+    // 1. Check for Liquidity Sweep (Only if trend aligns)
     if (swings.length > 0) {
-      const lastSwing = swings[swings.length - 1];
-      const sweep = signals.checkLiquiditySweep(state.candles5m, lastSwing);
+      const lastHigh = swings.filter((s) => s.type === "high").pop();
+      const lastLow = swings.filter((s) => s.type === "low").pop();
+
+      const sweepHigh = lastHigh
+        ? signals.checkLiquiditySweep(state.candles5m, lastHigh)
+        : null;
+      const sweepLow = lastLow
+        ? signals.checkLiquiditySweep(state.candles5m, lastLow)
+        : null;
+
+      let sweep = null;
+      if (sweepHigh && trend1h === "bearish") sweep = sweepHigh;
+      if (sweepLow && trend1h === "bullish") sweep = sweepLow;
 
       if (sweep) {
-        console.log(`[${symbol}] >>> SWEEP DETECTED! <<< Type: ${sweep.type}`);
+        console.log(
+          `[${symbol}] >>> SWEEP DETECTED! <<< Type: ${sweep.type} (Aligned with 1H ${trend1h} trend)`
+        );
         state.pendingSetup = {
           stage: "SWEPT",
           type: sweep.type,
           sweepCandle: sweep.candle,
           timestamp: Date.now(),
         };
+      } else if (sweepHigh || sweepLow) {
+        console.log(
+          `[${symbol}] Sweep detected but ignored (Counter-trend to 1H ${trend1h})`
+        );
       }
     }
   }
 
-  get1HStructure(symbol) {
-    const candles = this.state[symbol].candles1h;
-    if (candles.length < 5) return null;
-    const last = candles[candles.length - 1];
-    const prev = candles[candles.length - 10]; // Compare over a gap
-    if (last.close > prev.close) return "bullish";
-    if (last.close < prev.close) return "bearish";
-    return null;
-  }
+  // getTrend(symbol) removed in favor of HTF analysis
 
-  async processPendingSetup(symbol, closedCandle, h1Structure) {
+  async processPendingSetup(symbol, closedCandle, trend) {
     const state = this.state[symbol];
     const setup = state.pendingSetup;
 
-    // Timeout setups after 20 candles (5m * 20 = 100 mins)
+    // Timeout setups after 20 candles
     if (Date.now() - setup.timestamp > 20 * 300 * 1000) {
       console.log(`[${symbol}] Setup timed out.`);
       state.pendingSetup = null;
@@ -186,6 +229,7 @@ class StrategyEngine {
     }
 
     if (setup.stage === "SWEPT") {
+      console.log(`[${symbol}] Stage: SWEPT. Searching for BoS...`);
       // Look for BoS/CHoCH in opposite direction
       const targetType = setup.type === "bearish_sweep" ? "low" : "high";
       const recentSwings = signals.findSwingPoints(
@@ -198,36 +242,68 @@ class StrategyEngine {
         const bos = signals.checkStructureBreak(state.candles5m, relevantSwing);
         if (bos) {
           console.log(
-            `[${symbol}] BoS detected after sweep! Stage: STRUCTURE_BROKEN`
+            `[${symbol}] ✅ BoS Detected! Moving to STRUCTURE_BROKEN stage.`
           );
           setup.stage = "STRUCTURE_BROKEN";
           setup.bosCandle = closedCandle;
 
           // Find OB and FVG
+          console.log(`[${symbol}] Searching for FVG and OB...`);
           const obDirection =
             setup.type === "bearish_sweep" ? "bearish" : "bullish";
           setup.ob = signals.findOrderBlock(state.candles5m, obDirection);
           setup.fvg = signals.findFVG(state.candles5m);
 
-          if (!setup.ob || !setup.fvg) {
-            console.log(`[${symbol}] Missing OB or FVG. Setup invalidated.`);
+          if (setup.ob && setup.fvg) {
+            console.log(
+              `[${symbol}] ✅ FVG Found at ${setup.fvg.top}-${setup.fvg.bottom}`
+            );
+            console.log(
+              `[${symbol}] ✅ OB Found at ${setup.ob.candle.open}-${setup.ob.candle.close}`
+            );
+            console.log(
+              `[${symbol}] Setup Complete! Waiting for price to TAP the Order Block.`
+            );
+          } else {
+            if (!setup.ob)
+              console.log(`[${symbol}] ❌ No suitable Order Block found.`);
+            if (!setup.fvg)
+              console.log(`[${symbol}] ❌ No Fair Value Gap (FVG) found.`);
+            console.log(`[${symbol}] Setup invalidated.`);
             state.pendingSetup = null;
           }
         }
       }
     } else if (setup.stage === "STRUCTURE_BROKEN") {
+      const obHigh = Math.max(setup.ob.candle.open, setup.ob.candle.close);
+      const obLow = Math.min(setup.ob.candle.open, setup.ob.candle.close);
+      console.log(
+        `[${symbol}] Waiting for price to enter OB Range (${obLow.toFixed(
+          5
+        )} - ${obHigh.toFixed(5)}). Current Close: ${closedCandle.close.toFixed(
+          5
+        )}`
+      );
+
       // Wait for tap into OB
       if (signals.checkOBTap(closedCandle, setup.ob)) {
-        console.log(`[${symbol}] OB Tapped! EXECUTING TRADE`);
+        console.log(`[${symbol}] 🎯 OB Tapped! EXECUTING TRADE`);
         const tradeType = setup.type === "bearish_sweep" ? "sell" : "buy";
 
-        // 1:2 RR Calculation
-        const slDist = Math.abs(closedCandle.close - setup.ob.candle.high); // crude SL
+        // 10 Pips Fixed Stop Loss Calculation
+        let pipValue = 0.0001; // Default for 5 decimal pairs (GBPUSD)
+        if (symbol.includes("JPY")) pipValue = 0.01;
+        if (symbol.includes("XAU")) pipValue = 0.1;
+
+        const tenPips = pipValue * 10;
         const stopLoss =
           tradeType === "buy"
-            ? closedCandle.close - slDist
-            : closedCandle.close + slDist;
+            ? closedCandle.close - tenPips
+            : closedCandle.close + tenPips;
 
+        console.log(
+          `[${symbol}] Sending ${tradeType.toUpperCase()} order to Executor...`
+        );
         await executor.executeTrade(symbol, tradeType, stopLoss);
         state.pendingSetup = null;
       }

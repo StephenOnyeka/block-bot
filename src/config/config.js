@@ -14,7 +14,7 @@ const config = {
   },
   strategy: {
     timeframes: {
-      analysis: 3600, // 1 Hour in seconds
+      analysis: 3600, // 1 Hour in seconds (Trend)
       execution: 300, // 5 Minutes in seconds
     },
     riskReward: 1.2, // 1:2
